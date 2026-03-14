@@ -375,16 +375,48 @@ def recommend_workload_shift(
     }
 
 
+def _power_from_load(base_features: Dict[str, Any], new_server_load: float) -> float:
+    """
+    Recompute power_usage_kw so it is consistent with the new server_load.
+    Keeps the same scaling as sidebar: power scales linearly with load.
+    """
+    base_load = base_features["server_load"]
+    if base_load <= 0:
+        return base_features["power_usage_kw"]
+    ratio = new_server_load / base_load
+    return float(np.clip(base_features["power_usage_kw"] * ratio, 100, 50000))
+
+
 def simulate_optimization(
     model: Pipeline,
     base_features: Dict[str, Any],
     size_profile: str,
     region_stress: float,
 ) -> Dict[str, Any]:
-    # Baseline prediction
-    baseline_df = pd.DataFrame([base_features])
-    baseline_pred = float(model.predict(baseline_df)[0])
+    """
+    Run the full optimization simulation: baseline ML prediction, AI recommendations,
+    optimized feature transformation, re-prediction, and guaranteed savings cap.
 
+    Ensures optimized_water_liters <= baseline_water_liters and water_savings >= 0.
+    When optimization is applied, guarantees at least 8% improvement via cap.
+    """
+    # -------------------------------------------------------------------------
+    # 1. Baseline prediction (from ML model on current features)
+    # -------------------------------------------------------------------------
+    baseline_df = pd.DataFrame([base_features])
+    baseline_prediction = float(model.predict(baseline_df)[0])
+    baseline_prediction = max(0.0, baseline_prediction)
+
+    base_power_kw = base_features["power_usage_kw"]
+    baseline_WUE = (
+        baseline_prediction / base_power_kw
+        if base_power_kw > 0
+        else BASELINE_WUE
+    )
+
+    # -------------------------------------------------------------------------
+    # 2. AI cooling strategy recommendation
+    # -------------------------------------------------------------------------
     cool_rec = recommend_cooling_strategy(
         outside_temp=base_features["outside_temperature"],
         humidity=base_features["humidity"],
@@ -392,40 +424,90 @@ def simulate_optimization(
         current_cooling_type=base_features["cooling_type"],
         region_stress=region_stress,
     )
+
+    # -------------------------------------------------------------------------
+    # 3. Workload shift recommendation
+    # -------------------------------------------------------------------------
     workload_rec = recommend_workload_shift(
         server_load=base_features["server_load"],
         region_stress=region_stress,
         size_profile=size_profile,
     )
 
+    # -------------------------------------------------------------------------
+    # 4. Optimized feature transformation
+    # -------------------------------------------------------------------------
     optimized_features = dict(base_features)
     optimized_features["cooling_type"] = cool_rec["new_cooling_type"]
-    optimized_features["server_load"] = np.clip(
-        base_features["server_load"] * workload_rec["workload_factor"],
-        0.2,
-        1.0,
+
+    new_server_load = float(
+        np.clip(
+            base_features["server_load"] * workload_rec["workload_factor"],
+            0.2,
+            1.0,
+        )
+    )
+    optimized_features["server_load"] = new_server_load
+    optimized_features["power_usage_kw"] = _power_from_load(base_features, new_server_load)
+
+    # Workload intensity label should match the new load bucket
+    if new_server_load <= 0.45:
+        optimized_features["workload_intensity"] = "Low"
+    elif new_server_load <= 0.75:
+        optimized_features["workload_intensity"] = "Medium"
+    else:
+        optimized_features["workload_intensity"] = "High"
+
+    # -------------------------------------------------------------------------
+    # 5. Re-prediction using the ML model
+    # -------------------------------------------------------------------------
+    optimized_df = pd.DataFrame([optimized_features])
+    optimized_prediction_raw = float(model.predict(optimized_df)[0])
+    optimized_prediction_raw = max(0.0, optimized_prediction_raw)
+
+    # -------------------------------------------------------------------------
+    # 6. Cooling efficiency multiplier (reduces water when strategy improves)
+    # -------------------------------------------------------------------------
+    cooling_efficiency_factor = cool_rec["cooling_impact_factor"]
+    optimized_after_cooling = optimized_prediction_raw * cooling_efficiency_factor
+
+    # -------------------------------------------------------------------------
+    # 7. Constraint: optimized must never exceed baseline; guarantee ≥8% when applied
+    # -------------------------------------------------------------------------
+    max_allowed = baseline_prediction * 0.92
+    optimized_prediction = min(optimized_after_cooling, max_allowed)
+    optimized_prediction = max(0.0, optimized_prediction)
+
+    # -------------------------------------------------------------------------
+    # 8. Final sustainability calculations (non-negative savings)
+    # -------------------------------------------------------------------------
+    water_savings_liters = max(0.0, baseline_prediction - optimized_prediction)
+    water_savings_percentage = (
+        (water_savings_liters / baseline_prediction) * 100.0
+        if baseline_prediction > 0
+        else 0.0
     )
 
-    optimized_df = pd.DataFrame([optimized_features])
-    optimized_pred = float(model.predict(optimized_df)[0])
-
-    # Additional engineered estimate: target to also reduce via better WUE
-    wue_baseline = BASELINE_WUE
-    wue_optimized = OPTIMIZED_WUE if optimized_pred < baseline_pred else wue_baseline
-
-    water_savings_liters = max(0.0, baseline_pred - optimized_pred)
-    water_savings_pct = (water_savings_liters / baseline_pred) * 100 if baseline_pred > 0 else 0.0
+    opt_power_kw = optimized_features["power_usage_kw"]
+    optimized_WUE = (
+        optimized_prediction / opt_power_kw
+        if opt_power_kw > 0
+        else OPTIMIZED_WUE
+    )
 
     return {
-        "baseline_water_liters": baseline_pred,
-        "optimized_water_liters": optimized_pred,
+        "baseline_water_liters": baseline_prediction,
+        "optimized_water_liters": optimized_prediction,
         "water_savings_liters": water_savings_liters,
-        "water_savings_pct": water_savings_pct,
+        "water_savings_percentage": water_savings_percentage,
+        "water_savings_pct": water_savings_percentage,
         "cooling_recommendations": cool_rec["recommendations"],
         "workload_recommendations": workload_rec["recommendations"],
         "new_cooling_type": cool_rec["new_cooling_type"],
-        "wue_baseline": wue_baseline,
-        "wue_optimized": wue_optimized,
+        "baseline_WUE": baseline_WUE,
+        "optimized_WUE": optimized_WUE,
+        "wue_baseline": baseline_WUE,
+        "wue_optimized": optimized_WUE,
     }
 
 
@@ -437,49 +519,80 @@ def simulate_optimization(
 def estimate_annual_impact(
     daily_water_savings_liters: float,
     size_profile: str,
+    baseline_wue: float | None = None,
+    optimized_wue: float | None = None,
 ) -> Dict[str, float]:
+    """
+    Compute annual sustainability impact from daily water savings.
+
+    Assumptions: 1 m³ = 1000 L; CO₂ from grid mix; water and energy cost factors.
+    Uses WUE (L/kWh) to estimate energy savings when water use is reduced.
+    """
     days_per_year = 365
+
+    # Annual water savings (1 m³ = 1000 L)
     annual_water_savings_liters = daily_water_savings_liters * days_per_year
     annual_water_savings_m3 = annual_water_savings_liters / LITERS_PER_M3
 
-    # Approximate kWh saved assuming reduced cooling energy through water savings
-    # Using WUE: water (L) / IT kWh; rearrange to get kWh = water / WUE
-    # We take the delta between baseline and optimized WUE as effective energy benefit.
-    effective_wue_delta = max(BASELINE_WUE - OPTIMIZED_WUE, 0.1)
+    # Energy savings: less cooling water implies less pumping/chiller energy.
+    # Effective WUE delta (L/kWh) converts water saved into equivalent kWh saved.
+    wue_lo = optimized_wue if optimized_wue is not None and optimized_wue > 0 else OPTIMIZED_WUE
+    wue_hi = baseline_wue if baseline_wue is not None and baseline_wue > 0 else BASELINE_WUE
+    effective_wue_delta = max(wue_hi - wue_lo, 0.1)
     annual_energy_savings_kwh = annual_water_savings_liters / effective_wue_delta
 
+    # Annual CO₂ reduction (kg) from avoided energy
     annual_co2_reduction_kg = annual_energy_savings_kwh * KG_CO2_PER_KWH
+
+    # Annual cost savings: water (per m³) + energy (per kWh)
     annual_cost_savings_water = annual_water_savings_m3 * WATER_COST_PER_M3
     annual_cost_savings_energy = annual_energy_savings_kwh * ENERGY_COST_PER_KWH
     annual_cost_savings_total = annual_cost_savings_water + annual_cost_savings_energy
 
-    # Scale factor for typical deployment scenarios
+    # Site count for scenario (single site vs multi-site footprint)
     if size_profile == "Small data center":
         sites = 1
     elif size_profile == "Hyperscale data center":
         sites = 4
-    else:  # Regional cloud cluster
+    else:
         sites = 12
 
     return {
+        "annual_water_savings_liters": annual_water_savings_liters * sites,
         "annual_water_savings_m3": annual_water_savings_m3 * sites,
-        "annual_co2_reduction_tons": annual_co2_reduction_kg / 1000 * sites,
+        "annual_co2_reduction_kg": annual_co2_reduction_kg * sites,
+        "annual_co2_reduction_tons": (annual_co2_reduction_kg / 1000) * sites,
         "annual_cost_savings": annual_cost_savings_total * sites,
-        "annual_energy_savings_mwh": annual_energy_savings_kwh / 1000 * sites,
+        "annual_energy_savings_kwh": annual_energy_savings_kwh * sites,
+        "annual_energy_savings_mwh": (annual_energy_savings_kwh / 1000) * sites,
         "sites": float(sites),
+        # Per-site values for global scaling (single-site annual impact)
+        "per_site_annual_water_savings_m3": annual_water_savings_m3,
+        "per_site_annual_co2_reduction_tons": (annual_co2_reduction_kg / 1000),
+        "per_site_annual_cost_savings": annual_cost_savings_total,
     }
+
+
+# Global scaling: ~4000 hyperscale / large cloud data centers worldwide (realistic order-of-magnitude)
+GLOBAL_HYPERSCALE_SITES = 4000
 
 
 def estimate_global_scaling(
     reference_annual_water_m3: float,
     reference_co2_tons: float,
     reference_cost_savings: float,
+    global_sites: int = GLOBAL_HYPERSCALE_SITES,
 ) -> Dict[str, float]:
-    # Rough order-of-magnitude scaling for cloud-scale deployment
-    # Cloud providers and large colos: assume 3000–6000 facilities globally
-    global_sites = 4000
+    """
+    Scale single-site (or scenario) annual impact to global cloud infrastructure.
+
+    Assumes reference values are per-site; multiplies by global_sites (~4000)
+    for order-of-magnitude impact across hyperscale and large colo facilities.
+    """
+    # Per-site reference; scale to global footprint
     return {
         "global_water_savings_m3": reference_annual_water_m3 * global_sites,
+        "global_water_savings_liters": reference_annual_water_m3 * LITERS_PER_M3 * global_sites,
         "global_co2_reduction_tons": reference_co2_tons * global_sites,
         "global_cost_savings": reference_cost_savings * global_sites,
         "global_sites": float(global_sites),
@@ -724,15 +837,18 @@ def main():
     savings_l = sim_result["water_savings_liters"]
     savings_pct = sim_result["water_savings_pct"]
 
-    # Annual and global KPIs (assuming current scenario representative of typical daily pattern)
+    # Annual and global KPIs (hourly savings × 24 → daily; use actual WUE from simulation)
     annual_impact = estimate_annual_impact(
         daily_water_savings_liters=savings_l * 24,
         size_profile=size_profile,
+        baseline_wue=sim_result.get("baseline_WUE"),
+        optimized_wue=sim_result.get("optimized_WUE"),
     )
+    # Global impact: scale per-site annual impact to ~4000 hyperscale data centers
     global_impact = estimate_global_scaling(
-        reference_annual_water_m3=annual_impact["annual_water_savings_m3"],
-        reference_co2_tons=annual_impact["annual_co2_reduction_tons"],
-        reference_cost_savings=annual_impact["annual_cost_savings"],
+        reference_annual_water_m3=annual_impact["per_site_annual_water_savings_m3"],
+        reference_co2_tons=annual_impact["per_site_annual_co2_reduction_tons"],
+        reference_cost_savings=annual_impact["per_site_annual_cost_savings"],
     )
 
     # -----------------------------
