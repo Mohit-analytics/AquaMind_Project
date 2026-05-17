@@ -151,7 +151,7 @@ water_usage_liters
 ## Clone Repository
 
 ```bash
-git clone https://github.com/yourusername/aquamind.git
+git clone https://github.com/Mohit-analytics/AquaMind_Project.git
 cd aquamind
 ```
 
@@ -339,9 +339,12 @@ AquaMind demonstrates how AI can help:
 
 ---
 
+
+
 # Authors
 
-Developed as an AI + Sustainability Engineering project focused on intelligent infrastructure optimization.
+Mohit Sharma  
+AI & Sustainability Engineering Enthusiast
 
 ---
 
